@@ -11,7 +11,7 @@ class MonteCarloBarostat(BarostatHook):
     MC Barostat at https://github.com/openmm/openmm/blob/master/openmmapi/src/MonteCarloBarostatImpl.cpp
     Uses BarostatHook as the base class
     """
-    def __init__(self, target_pressure, temperature_bath, frequency=25, detach=True):
+    def __init__(self, target_pressure, temperature_bath, frequency=25, nmol=1, energy_unit="kJ/mol", detach=True):
 
         super(MonteCarloBarostat, self).__init__(
             target_pressure=target_pressure,
@@ -19,11 +19,15 @@ class MonteCarloBarostat(BarostatHook):
             detach=detach
         )
         #Convert pressure to Ha/nm^3
-        self.target_pressure = self.target_pressure * MDUnits.unit2unit("kj/mol", "Ha")
+        self.target_pressure *= MDUnits.unit2unit("kj/mol", "Ha")
         #Frequency to attempt MC move
         self.frequency = frequency
         #Convert kT to Ha
         self.kb_temperature = self.temperature_bath * MDUnits.kB * MDUnits.unit2unit("kj/mol", "Ha")
+        #Need number of molecules, and this needs to be supplied as SchNet doesn't provide this info to us
+        self.nmol = nmol
+        #Energy units of model
+        self.energy_unit = energy_unit
 
     def _init_barostat(self, simulator):
         #Initial amount to scale volume
@@ -42,8 +46,10 @@ class MonteCarloBarostat(BarostatHook):
             pass
         else:
             self.step = 0
+
             #Get initial energy of the system
             initial_energy = simulator.system.properties["energy"]
+
             #Get volume
             volume = simulator.system.volume
             #Get random number to increase/decrease volume by
@@ -51,24 +57,27 @@ class MonteCarloBarostat(BarostatHook):
             newVol = volume + deltaVol
             #Determines how much to scale each side of the box by
             lengthScale = torch.pow(newVol/volume, 1.0/3.0)
+
             #Get initial posiitons, cell vectors and forces. Will be used to
             #revert system back if move is not accepted
             initial_pos = simulator.system.positions.clone()
             initial_cell = simulator.system.cells.clone()
             initial_forces = simulator.system.forces.clone()
-            #Scale the coordinates by lengthScale
+
+            #Scale the coordinates and boxvectors by lengthScale
             self._scale_coordinates(simulator, lengthScale, lengthScale, lengthScale)
-            #Scale box vectors by lengthScale
             simulator.system.cells *= lengthScale
 
             #Calculate system to get new energy
             simulator.calculator.calculate(simulator.system)
             final_energy = simulator.system.properties["energy"]
+
             #Convert energy change from eV (model units) to hartree
-            dE = (final_energy - initial_energy) * MDUnits.unit2unit("ev", "Ha")
+            dE = (final_energy - initial_energy) * MDUnits.unit2unit(self.energy_unit, "Ha")
 
             #Units are Ha + Ha/nm^3 * nm^3 - Ha 
-            w = dE + self.target_pressure * deltaVol - self.kb_temperature * torch.log(newVol/volume)
+            w = dE + self.target_pressure * deltaVol - self.nmol * self.kb_temperature * torch.log(newVol/volume)
+
             #Determine whether to accept or reject MC move
             if w > 0 and torch.rand(1, device='cuda') > torch.exp(-w/self.kb_temperature):
                 #Step rejected, revert to initial system
@@ -93,10 +102,41 @@ class MonteCarloBarostat(BarostatHook):
 
     def _scale_coordinates(self, simulator, scX, scY, scZ):
         #Scale com by scX, scY and scZ
-        dr = torch.sub(simulator.system.center_of_mass, simulator.system.positions)
-        scale = torch.tensor([[[scX, scY, scZ]]]).cuda()
-        com = torch.mul(simulator.system.center_of_mass, scale)
-        simulator.system.positions = torch.sub(com, dr)
+        
+        new_pos = simulator.system.positions.clone()
+        initial_cell = simulator.system.cells.clone()
+
+        if self.nmol > 1:
+            cell_x = torch.repeat_interleave(initial_cell[0, 0, 0, :][None, None, None, :], new_pos.shape[2], dim=2)
+            cell_y = torch.repeat_interleave(initial_cell[0, 0, 1, :][None, None, None, :], new_pos.shape[2], dim=2)
+            cell_z = torch.repeat_interleave(initial_cell[0, 0, 2, :][None, None, None, :], new_pos.shape[2], dim=2)
+            
+            new_pos -= cell_z * torch.floor(new_pos[0, 0, :, 2]/initial_cell[0, 0, 2, 2])[None, None, :, None] 
+            new_pos -= cell_y * torch.floor(new_pos[0, 0, :, 1]/initial_cell[0, 0, 1, 1])[None, None, :, None]
+            new_pos -= cell_x * torch.floor(new_pos[0, 0, :, 0]/initial_cell[0, 0, 0, 0])[None, None, :, None]
+
+            scale = torch.tensor([[[scX, scY, scZ]]]).unsqueeze(2).cuda()
+            scale = torch.repeat_interleave(scale, new_pos.shape[2], dim=2)
+            new_pos = torch.mul(new_pos, scale)
+            
+            offset = new_pos - simulator.system.positions
+            
+            simulator.system.positions += offset
+
+        else:
+            center = torch.sum(new_pos, dim=2).unsqueeze(2)
+            center /= new_pos.shape[2]
+
+            center -= initial_cell[0, 0, 2, :] * torch.floor(center[0, 0, 0, 2]/initial_cell[0, 0, 2, 2])
+            center -= initial_cell[0, 0, 1, :] * torch.floor(center[0, 0, 0, 1]/initial_cell[0, 0, 1, 1])
+            center -= initial_cell[0, 0, 0, :] * torch.floor(center[0, 0, 0, 0]/initial_cell[0, 0, 0, 0])
+
+            scale = torch.tensor([[[scX, scY, scZ]]]).unsqueeze(2).cuda()
+            center = torch.mul(center, scale)
+
+            offset = center - simulator.system.positions
+
+            simulator.system.positions += offset
 
     def on_step_end(self, simulator):
         #Don't do anything on step end unlike other barostats
@@ -111,7 +151,7 @@ class MonteCarloAnisotropicBarostat(MonteCarloBarostat):
     https://github.com/openmm/openmm/blob/master/openmmapi/src/MonteCarloAnisotropicBarostatImpl.cpp
     Uses MonteCarloBarostat as the base class
     """
-    def __init__(self, target_pressure, temperature_bath, frequency=25, detach=True):
+    def __init__(self, target_pressure, temperature_bath, frequency=25, nmol=1, energy_unit="kJ/mol", detach=True):
 
         super(MonteCarloAnisotropicBarostat, self).__init__(
             target_pressure=target_pressure,
@@ -165,8 +205,9 @@ class MonteCarloAnisotropicBarostat(MonteCarloBarostat):
             #Get new energy, this part is the same as in MC barostat
             simulator.calculator.calculate(simulator.system)
             final_energy = simulator.system.properties["energy"]
-            dE = (final_energy - initial_energy) * MDUnits.unit2unit("ev", "Ha")
-            w = dE + self.target_pressure * deltaVol - self.kb_temperature * torch.log(newVol/volume)
+            dE = (final_energy - initial_energy) * MDUnits.unit2unit(self.energy_unit, "Ha")
+
+            w = dE + self.target_pressure * deltaVol - self.nmol * self.kb_temperature * torch.log(newVol/volume)
 
             if w > 0 and torch.rand(1, device='cuda') > torch.exp(-w/self.kb_temperature):
                 simulator.system.positions = initial_pos
