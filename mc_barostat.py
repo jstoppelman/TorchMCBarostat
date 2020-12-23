@@ -127,14 +127,15 @@ class MonteCarloBarostat(BarostatHook):
             center = torch.sum(new_pos, dim=2).unsqueeze(2)
             center /= new_pos.shape[2]
 
-            center -= initial_cell[0, 0, 2, :] * torch.floor(center[0, 0, 0, 2]/initial_cell[0, 0, 2, 2])
-            center -= initial_cell[0, 0, 1, :] * torch.floor(center[0, 0, 0, 1]/initial_cell[0, 0, 1, 1])
-            center -= initial_cell[0, 0, 0, :] * torch.floor(center[0, 0, 0, 0]/initial_cell[0, 0, 0, 0])
+            new_center = center
+            new_center -= initial_cell[0, 0, 2, :] * torch.floor(new_center[0, 0, 0, 2]/initial_cell[0, 0, 2, 2])
+            new_center -= initial_cell[0, 0, 1, :] * torch.floor(new_center[0, 0, 0, 1]/initial_cell[0, 0, 1, 1])
+            new_center -= initial_cell[0, 0, 0, :] * torch.floor(new_center[0, 0, 0, 0]/initial_cell[0, 0, 0, 0])
 
             scale = torch.tensor([[[scX, scY, scZ]]]).unsqueeze(2).cuda()
-            center = torch.mul(center, scale)
+            new_center = torch.mul(new_center, scale)
 
-            offset = center - simulator.system.positions
+            offset = new_center - center
 
             simulator.system.positions += offset
 
@@ -156,9 +157,11 @@ class MonteCarloAnisotropicBarostat(MonteCarloBarostat):
         super(MonteCarloAnisotropicBarostat, self).__init__(
             target_pressure=target_pressure,
             temperature_bath=temperature_bath,
+            frequency=frequency, 
+            energy_unit=energy_unit,
             detach=detach
         )
-
+    
     def _init_barostat(self, simulator):
         #volScale will now be a size 3 tensor, as each side of the box can be scaled individually
         self.volScale = 0.01*torch.repeat_interleave(simulator.system.volume, 3, dim=0).reshape(3)
